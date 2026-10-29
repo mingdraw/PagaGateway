@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -242,7 +243,7 @@ func TestBackgroundManagementReusesStartConfiguration(t *testing.T) {
 	writeConfig(secondClient.config, secondConfig)
 	start(secondClient)
 	for _, action := range []string{"status", "stop", "restart"} {
-		if output, err := commandIn(queryDirectory, "client", action); err == nil || !strings.Contains(output, "多个后台 Client") || !strings.Contains(output, secondClient.state) {
+		if output, err := commandIn(queryDirectory, "client", action); err == nil || !strings.Contains(output, "多个后台 Client") || !strings.Contains(output, "-pidfile "+strconv.Quote(secondClient.state)) {
 			t.Fatalf("ambiguous Client %s: %v\n%s", action, err, output)
 		}
 	}

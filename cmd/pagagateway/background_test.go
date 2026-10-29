@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -226,12 +227,12 @@ func TestBackgroundCommands(t *testing.T) {
 	secondReserve.Close()
 	writeConfig("second-server.json", secondConfig)
 	mustRun("server", "start", "-config", "second-server.json")
-	if output, err := command("server", "clients"); err == nil || !strings.Contains(output, "多个后台 Server") || !strings.Contains(output, serverStatePath) || !strings.Contains(output, "second-server.json.pid") {
+	if output, err := command("server", "clients"); err == nil || !strings.Contains(output, "多个后台 Server") || !strings.Contains(output, "-pidfile "+strconv.Quote(serverStatePath)) || !strings.Contains(output, "second-server.json.pid") {
 		t.Fatalf("ambiguous Server query: %v\n%s", err, output)
 	}
 	mustRun("server", "clients", "-pidfile", serverStatePath)
 	for _, action := range []string{"status", "stop", "restart"} {
-		if output, err := command("server", action); err == nil || !strings.Contains(output, "多个后台 Server") || !strings.Contains(output, serverStatePath) {
+		if output, err := command("server", action); err == nil || !strings.Contains(output, "多个后台 Server") || !strings.Contains(output, "-pidfile "+strconv.Quote(serverStatePath)) {
 			t.Fatalf("ambiguous Server %s: %v\n%s", action, err, output)
 		}
 	}
