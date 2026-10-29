@@ -1,0 +1,8 @@
+{
+  "server": "192.168.1.10:7443",
+  "server_fingerprint": "",
+  "id": "office",
+  "token": "replace-with-client-token",
+  "allowed_targets": ["10.0.0.10:22", "10.0.0.20:3389"],
+  "max_tunnels": 128
+}

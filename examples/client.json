@@ -1,0 +1,8 @@
+{
+  "server": "relay.example.com:7443",
+  "server_fingerprint": "REPLACE_WITH_SERVER_CERTIFICATE_SHA256",
+  "id": "office",
+  "token": "replace-with-client-token",
+  "allowed_targets": ["10.0.0.10:22", "10.0.0.20:3389"],
+  "max_tunnels": 128
+}

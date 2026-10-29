@@ -31,3 +31,15 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+/dist/
+/pagagateway
+/server.crt
+/server.key
+/server.json
+/client.json
+*.env
+*.pid
+*.pid.lock
+*.log
+.pagagateway-state-*

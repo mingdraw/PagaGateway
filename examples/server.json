@@ -1,0 +1,13 @@
+{
+  "listen": "0.0.0.0:7443",
+  "cert_file": "server.crt",
+  "key_file": "server.key",
+  "max_connections": 1024,
+  "routes": [
+    {
+      "id": "office",
+      "client_token": "replace-with-client-token",
+      "access_token": "replace-with-access-token"
+    }
+  ]
+}
