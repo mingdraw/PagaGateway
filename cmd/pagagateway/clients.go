@@ -33,6 +33,12 @@ func listBackgroundClients(ctx context.Context, config, statePath string, asJSON
 	if reply.Clients == nil {
 		return errors.New("invalid client list response")
 	}
+	for i := range reply.Clients {
+		client := &reply.Clients[i]
+		if client.Status == "online" && client.ClientVersion == "" {
+			client.ClientVersion = gateway.LegacyClientVersion
+		}
+	}
 	return writeClientList(os.Stdout, reply.Clients, asJSON)
 }
 
@@ -57,7 +63,7 @@ func writeClientList(output io.Writer, clients []gateway.ClientInfo, asJSON bool
 		return err
 	}
 	table := tabwriter.NewWriter(output, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(table, "CLIENT_ID\tSTATUS\tADDRESS\tCONNECTED_AT\tLAST_HEARTBEAT\tACTIVE\tPENDING\tLIMIT\tBUSY_REJECTS"); err != nil {
+	if _, err := fmt.Fprintln(table, "CLIENT_ID\tSTATUS\tADDRESS\tCONNECTED_AT\tLAST_HEARTBEAT\tACTIVE\tPENDING\tLIMIT\tBUSY_REJECTS\tCLIENT_VERSION"); err != nil {
 		return err
 	}
 	for _, client := range clients {
@@ -69,8 +75,12 @@ func writeClientList(output io.Writer, clients []gateway.ClientInfo, asJSON bool
 		if client.MaxTunnels > 0 {
 			limit = strconv.Itoa(client.MaxTunnels)
 		}
-		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%d\n", client.ID, client.Status, address,
-			clientTime(client.ConnectedAt), clientTime(client.LastHeartbeatAt), client.ActiveTunnels, client.PendingTunnels, limit, client.BusyRejects); err != nil {
+		version := client.ClientVersion
+		if version == "" {
+			version = "-"
+		}
+		if _, err := fmt.Fprintf(table, "%s\t%s\t%s\t%s\t%s\t%d\t%d\t%s\t%d\t%s\n", client.ID, client.Status, address,
+			clientTime(client.ConnectedAt), clientTime(client.LastHeartbeatAt), client.ActiveTunnels, client.PendingTunnels, limit, client.BusyRejects, version); err != nil {
 			return err
 		}
 	}

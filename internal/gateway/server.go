@@ -17,6 +17,7 @@ type agent struct {
 	ctx          context.Context
 	dialFeedback bool
 	maxTunnels   int
+	version      string
 	// Lifecycle and counters are protected by Server.mu.
 	online          bool
 	pending         int
@@ -241,6 +242,10 @@ func (s *Server) register(c net.Conn, m Message, deadline time.Time, admitted fu
 	a := &agent{
 		conn: c, writer: newControlWriter(c), ctx: ctx,
 		address: c.RemoteAddr().String(), maxTunnels: limit, dialFeedback: m.DialFeedback,
+		version: cleanClientVersion(m.ClientVersion),
+	}
+	if a.version == "" {
+		a.version = LegacyClientVersion
 	}
 	s.mu.Lock()
 	if s.agents[id] != nil {

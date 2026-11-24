@@ -110,9 +110,16 @@ func (c *Client) runOnce(parent context.Context) error {
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
 	registration := Message{
 		Kind: "register", ClientID: c.config.ID, Token: c.config.Token,
-		MaxTunnels: c.config.MaxTunnels, DialFeedback: true,
+		ClientVersion: cleanClientVersion(c.config.BuildVersion),
+		MaxTunnels:    c.config.MaxTunnels, DialFeedback: true,
 	}
-	if err = WriteMessage(conn, registration); err != nil {
+	err = WriteMessage(conn, registration)
+	if errors.Is(err, errInvalidFrame) && registration.ClientVersion != "" {
+		// The version is optional; leave room for the original registration.
+		registration.ClientVersion = ""
+		err = WriteMessage(conn, registration)
+	}
+	if err != nil {
 		return clientConnectionError("发送注册请求失败", err)
 	}
 	m, err := ReadMessage(conn)

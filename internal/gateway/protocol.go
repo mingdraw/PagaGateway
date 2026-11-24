@@ -25,17 +25,18 @@ var (
 
 // Message is length-prefixed JSON. After ready, the connection carries raw TCP.
 type Message struct {
-	Version      int    `json:"version"`
-	Kind         string `json:"kind"`
-	ClientID     string `json:"client_id,omitempty"`
-	Token        string `json:"token,omitempty"`
-	ID           string `json:"id,omitempty"`
-	Host         string `json:"host,omitempty"`
-	Port         uint16 `json:"port,omitempty"`
-	Error        string `json:"error,omitempty"`
-	MaxTunnels   int    `json:"max_tunnels,omitempty"`
-	DialFeedback bool   `json:"dial_feedback,omitempty"`
-	TimeoutMS    int64  `json:"timeout_ms,omitempty"`
+	Version       int    `json:"version"`
+	Kind          string `json:"kind"`
+	ClientID      string `json:"client_id,omitempty"`
+	ClientVersion string `json:"client_version,omitempty"`
+	Token         string `json:"token,omitempty"`
+	ID            string `json:"id,omitempty"`
+	Host          string `json:"host,omitempty"`
+	Port          uint16 `json:"port,omitempty"`
+	Error         string `json:"error,omitempty"`
+	MaxTunnels    int    `json:"max_tunnels,omitempty"`
+	DialFeedback  bool   `json:"dial_feedback,omitempty"`
+	TimeoutMS     int64  `json:"timeout_ms,omitempty"`
 }
 
 func ReadMessage(r io.Reader) (Message, error) {

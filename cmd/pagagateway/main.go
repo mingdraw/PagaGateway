@@ -185,6 +185,7 @@ func runGateway(ctx context.Context, role, configPath string, ready func(*gatewa
 		if err := gateway.LoadConfig(configPath, &configValue); err != nil {
 			return err
 		}
+		configValue.BuildVersion = version
 		c, err := gateway.NewClient(configValue)
 		if err != nil {
 			return err

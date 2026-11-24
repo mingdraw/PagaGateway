@@ -31,7 +31,8 @@ func TestBackgroundCommands(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		binary += ".exe"
 	}
-	build := exec.Command("go", "build", "-o", binary, ".")
+	const fixtureVersion = "0.9.7"
+	build := exec.Command("go", "build", "-ldflags", "-X main.version=v"+fixtureVersion, "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build: %v\n%s", err, output)
 	}
@@ -333,13 +334,14 @@ func TestBackgroundCommands(t *testing.T) {
 	}
 	defer tunnel.Close()
 	clients := clientList()
-	if clients[0].Status != "online" || clients[0].ConnectedAt == nil {
-		t.Fatalf("registered Client is not online: %+v", clients[0])
+	if clients[0].Status != "online" || clients[0].ConnectedAt == nil || clients[0].ClientVersion != fixtureVersion {
+		t.Fatalf("registered Client status or build version is wrong: %+v", clients[0])
 	}
 	if host, port, err := net.SplitHostPort(clients[0].Address); err != nil || host != "127.0.0.1" || port == "" {
 		t.Fatalf("client address is not the observed peer: %+v", clients[0])
 	}
-	if output := mustRun("server", "clients"); !strings.Contains(output, "1 online / 2 configured") || !strings.Contains(output, clients[0].Address) {
+	if output := mustRun("server", "clients"); !strings.Contains(output, "1 online / 2 configured") ||
+		!strings.Contains(output, clients[0].Address) || !strings.Contains(output, "CLIENT_VERSION") || !strings.Contains(output, fixtureVersion) {
 		t.Fatal(output)
 	}
 	payload := bytes.Repeat([]byte("background relay\x00\xff"), 1024)

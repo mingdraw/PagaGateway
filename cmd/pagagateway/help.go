@@ -32,7 +32,7 @@ func writeHelp(output io.Writer, topic string) error {
   status       查看后台运行状态
   stop         停止后台实例
   restart      重新读取原配置并重启后台实例
-  clients      查看客户端地址和在线状态，仅 Server 支持
+  clients      查看客户端版本、地址和在线状态，仅 Server 支持
 
 示例:
   pagagateway server start -config server.json
@@ -87,7 +87,7 @@ func roleHelp(role string) string {
   restart                 重新读取原配置并重启后台实例
 `)
 	if role == "server" {
-		text.WriteString("  clients                 查看配置中的客户端地址和在线状态\n")
+		text.WriteString("  clients                 查看客户端版本、地址和在线状态\n")
 	}
 	text.WriteString("  help                    显示本服务的帮助\n\n参数:\n")
 	text.WriteString("  -config file  JSON 配置路径，run/start 必填；管理命令可省略\n")

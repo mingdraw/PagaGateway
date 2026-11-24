@@ -37,12 +37,13 @@ type ServerConfig struct {
 }
 
 type ClientConfig struct {
-	Server      string   `json:"server"`
-	Fingerprint string   `json:"server_fingerprint,omitempty"`
-	ID          string   `json:"id"`
-	Token       string   `json:"token"`
-	Allow       []string `json:"allowed_targets"`
-	MaxTunnels  int      `json:"max_tunnels"`
+	Server       string   `json:"server"`
+	Fingerprint  string   `json:"server_fingerprint,omitempty"`
+	ID           string   `json:"id"`
+	Token        string   `json:"token"`
+	Allow        []string `json:"allowed_targets"`
+	MaxTunnels   int      `json:"max_tunnels"`
+	BuildVersion string   `json:"-"` // set by the running executable
 }
 
 func LoadConfig(path string, value any) error {

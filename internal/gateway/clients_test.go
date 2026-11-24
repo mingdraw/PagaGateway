@@ -13,6 +13,9 @@ func TestClientListLifecycle(t *testing.T) {
 		if len(clients) != 1 || clients[0].ID != "office" || clients[0].Status != "offline" || clients[0].Address != "" || clients[0].ConnectedAt != nil || clients[0].LastHeartbeatAt != nil {
 			t.Fatalf("unexpected offline snapshot: %+v", clients)
 		}
+		if clients[0].ClientVersion != "" {
+			t.Fatalf("offline Client retained a version: %+v", clients[0])
+		}
 	}
 	assertOffline()
 	// Query while registration, heartbeats and disconnects modify the presence map.
@@ -39,6 +42,9 @@ func TestClientListLifecycle(t *testing.T) {
 	if client.Status != "online" || client.Address != conn.LocalAddr().String() || client.ConnectedAt == nil || client.ConnectedAt.Before(before) || client.ConnectedAt.After(time.Now()) || client.LastHeartbeatAt != nil {
 		t.Fatalf("unexpected registered snapshot: %+v", client)
 	}
+	if client.ClientVersion != "0.1.0" {
+		t.Fatalf("legacy Client version = %q, want 0.1.0", client.ClientVersion)
+	}
 	connectedAt := *client.ConnectedAt
 	// Mutating a returned snapshot must not change runtime metadata.
 	*client.ConnectedAt = time.Time{}
@@ -61,7 +67,7 @@ func TestClientListLifecycle(t *testing.T) {
 	_ = conn.Close()
 	f.waitOnline(t, false)
 	assertOffline()
-	conn, reply = f.request(t, Message{Kind: "register", ClientID: "office", Token: testClientToken})
+	conn, reply = f.request(t, Message{Kind: "register", ClientID: "office", Token: testClientToken, ClientVersion: "v0.2.0-rc.1"})
 	if reply.Kind != "registered" {
 		t.Fatal(reply)
 	}
@@ -69,6 +75,9 @@ func TestClientListLifecycle(t *testing.T) {
 	client = f.s.Clients()[0]
 	if client.Status != "online" || client.Address != conn.LocalAddr().String() || !client.ConnectedAt.After(connectedAt) || client.LastHeartbeatAt != nil {
 		t.Fatalf("reconnect retained old connection metadata: %+v", client)
+	}
+	if client.ClientVersion != "0.2.0-rc.1" {
+		t.Fatalf("reconnected Client version = %q, want 0.2.0-rc.1", client.ClientVersion)
 	}
 }
 

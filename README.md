@@ -230,8 +230,9 @@ Windows PowerShell 使用 `.\pagagateway.exe server clients`，参数相同。�
 | `ACTIVE` / `PENDING` | 当前活动和待配对的隧道 |
 | `LIMIT` | Client 报告或 route 配置的并发上限，未知时为 `-` |
 | `BUSY_REJECTS` | 本次 Server 运行期间该 route 的繁忙拒绝数 |
+| `CLIENT_VERSION` | Client 上报的程序版本；在线且未上报时为 `0.1.0`，离线时为 `-` |
 
-`online` 反映 Client 与 Server 的控制连接，不代表内网目标服务可用。断开后或约 35 秒未收到心跳会转为 `offline`；离线行的地址和时间显示 `-`，重连重新计时，不保留历史连接。表格时间使用查询命令所在机器的本地时区；JSON 的 `connected_at`、`last_heartbeat_at` 使用 UTC 的 RFC 3339 格式，无值时为 `null`，离线 `address` 为空字符串。
+`online` 反映 Client 与 Server 的控制连接，不代表内网目标服务可用。断开后或约 35 秒未收到心跳会转为 `offline`；离线行的地址和时间显示 `-`，重连重新计时，不保留历史连接。表格时间使用查询命令所在机器的本地时区；JSON 的 `connected_at`、`last_heartbeat_at` 使用 UTC 的 RFC 3339 格式，无值时为 `null`，离线 `address` 为空字符串。JSON 使用 `client_version` 字段，离线时省略。
 
 查询复用仅监听本机回环地址、带实例认证的管理接口。Server、Client 在系统临时目录的私有目录中登记当前用户、当前可执行文件所属实例的状态文件位置，正常停止会移除记录；记录不包含令牌或管理密钥，查询会核验后台实例身份。请保留正在运行实例的记录和状态文件。列表不包含注册令牌、访问令牌或后台管理密钥。修改 routes 后执行 `server restart` 才会反映到列表。
 

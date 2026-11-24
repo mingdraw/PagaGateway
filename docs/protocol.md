@@ -12,7 +12,7 @@ Server 同时配置 `cert_file`、`key_file` 时使用 TLS 1.3；客户端配置
 
 | 首帧 kind | 字段 | 验证与结果 |
 |---|---|---|
-| `register` | `client_id`, `token`，可选 `max_tunnels`、`dial_feedback` | route 注册令牌；返回 `registered`，保持控制连接 |
+| `register` | `client_id`, `token`，可选 `max_tunnels`、`dial_feedback`、`client_version` | route 注册令牌；返回 `registered`，保持控制连接 |
 | `open` | `client_id`, `token`, `host`, `port`，可选 `timeout_ms` | route 访问令牌；等待回连，成功返回 `ready` |
 | `work` | `client_id`, `token`, `id`, 可选 `error` | route 注册令牌及当前控制会话的一次性 ID；不回响应帧 |
 
@@ -25,6 +25,8 @@ Server 同时配置 `cert_file`、`key_file` 时使用 TLS 1.3；客户端配置
 Client 检查目标允许列表（`allowed_targets` 包含 `"*"` 时允许任意目标地址和端口）、拨号目标（最多 10 秒），按控制连接相同的 TLS / 无证书 TCP 模式新建工作连接并发 `work` 首帧。成功不含 `error`；旧 Client 通过 `work.error` 回报目标拒绝或不可用。Server 只接受当前 route、当前控制会话且尚未消费的请求 ID，过期或重复 ID 拒绝。
 
 ### 可选的 v1 扩展
+
+- `client_version` 是 Client 程序版本，独立于帧的协议版本 `version: 1`。未携带此字段的 Client 仍按原流程注册，Server 为其显示 `0.1.0`。
 
 - 新 Client 可在 `register` 报告 `max_tunnels` 和 `dial_feedback: true`。Server 按 Client 报告值与 route 配置值中较低的正数控制并发；未报告且未配置时，使用服务端总额度。旧 Client 收到的 `registered`、`dial`、`pong` 保留原字段和格式。
 - 只有 `registered` 确认 `dial_feedback: true`，Client 才会在控制连接上发 `{"version":1,"kind":"dialFailed","id":"请求 ID","error":"code"}`。允许的原因是 `clientBusy`、`workUnavailable`、`targetDenied`、`targetUnavailable`、`targetTimeout`；其他原因归为 `targetUnavailable`。过期反馈忽略。协商成功的 Client 在成功的 `work` 首帧携带 `dial_feedback: true`，Server 拒绝此类工作流时直接关闭，避免把协议错误帧当成目标数据。
