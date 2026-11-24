@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"log"
+	"math/rand/v2"
 	"net"
 	"strconv"
 	"strings"
@@ -13,8 +14,14 @@ import (
 )
 
 type Client struct {
-	config ClientConfig
-	tls    *tls.Config
+	config         ClientConfig
+	tls            *tls.Config
+	allowAll       bool
+	allowedTargets map[string]struct{}
+
+	statusMu      sync.RWMutex
+	status        ClientStatus
+	lastTunnelLog time.Time
 }
 
 func NewClient(c ClientConfig) (*Client, error) {
@@ -29,7 +36,18 @@ func NewClient(c ClientConfig) (*Client, error) {
 			return nil, err
 		}
 	}
-	return &Client{config: c, tls: t}, nil
+	client := &Client{
+		config: c, tls: t, allowedTargets: make(map[string]struct{}, len(c.Allow)),
+		status: ClientStatus{State: ClientConnecting, MaxTunnels: c.MaxTunnels},
+	}
+	for _, address := range c.Allow {
+		if address == "*" {
+			client.allowAll = true
+			break
+		}
+		client.allowedTargets[strings.ToLower(address)] = struct{}{}
+	}
+	return client, nil
 }
 
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
@@ -44,6 +62,7 @@ func (c *Client) dial(ctx context.Context) (net.Conn, error) {
 // Run reconnects with bounded exponential backoff. Existing tunnels terminate
 // with the control session; they are never silently reattached or replayed.
 func (c *Client) Run(ctx context.Context) error {
+	c.setStatus(ClientStatus{State: ClientConnecting})
 	delay := time.Second
 	for ctx.Err() == nil {
 		started := time.Now()
@@ -51,13 +70,15 @@ func (c *Client) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
-		if err != nil {
-			log.Print("Page client disconnected; retrying")
-		}
 		if time.Since(started) > time.Minute {
 			delay = time.Second
 		}
-		timer := time.NewTimer(delay)
+		wait := delay - time.Duration(rand.Int64N(int64(delay/4)+1))
+		if err != nil {
+			c.setStatus(ClientStatus{State: ClientReconnecting, LastError: err.Error(), LastErrorAt: time.Now().UTC()})
+			log.Printf("Page client retrying in %s: %s", wait.Round(time.Millisecond), err)
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -75,29 +96,58 @@ func (c *Client) runOnce(parent context.Context) error {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		cancel()
-		return err
+		// tls.Dialer returns the TCP dial error unchanged if it never reached TLS.
+		var opErr *net.OpError
+		if c.tls != nil && !(errors.As(err, &opErr) && opErr.Op == "dial") {
+			return clientConnectionError("TLS 握手失败", err)
+		}
+		return clientConnectionError("连接 Server 失败", err)
 	}
 	var workers sync.WaitGroup
 	defer func() { cancel(); _ = conn.Close(); workers.Wait() }()
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-stop:
-		}
-	}()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	_ = conn.SetDeadline(time.Now().Add(handshakeTimeout))
-	if err = WriteMessage(conn, Message{Kind: "register", ClientID: c.config.ID, Token: c.config.Token}); err != nil {
-		return err
+	registration := Message{
+		Kind: "register", ClientID: c.config.ID, Token: c.config.Token,
+		MaxTunnels: c.config.MaxTunnels, DialFeedback: true,
+	}
+	if err = WriteMessage(conn, registration); err != nil {
+		return clientConnectionError("发送注册请求失败", err)
 	}
 	m, err := ReadMessage(conn)
-	if err != nil || m.Kind != "registered" {
-		return errors.New("registration rejected")
+	if err != nil {
+		return clientConnectionError("读取注册响应失败", err)
+	}
+	if m.Kind == "error" {
+		return clientRegistrationError(m.Error)
+	}
+	if m.Kind != "registered" {
+		return errors.New("注册失败：Server 返回了意外的注册响应")
 	}
 	_ = conn.SetWriteDeadline(time.Time{})
+	c.setStatus(ClientStatus{State: ClientConnected})
 	log.Print("Page client registered")
+	writer := newControlWriter(conn)
+	controlWriteErr := make(chan error, 1)
+	sendControl := func(message Message, failure string) bool {
+		err := writer.send(message, time.Now().Add(handshakeTimeout))
+		if err == nil || errors.Is(err, errControlWriteExpired) {
+			return true
+		}
+		select {
+		case controlWriteErr <- clientConnectionError(failure, err):
+		default:
+		}
+		_ = conn.Close()
+		return false
+	}
+	var feedback func(id, code string)
+	if m.DialFeedback {
+		feedback = func(id, code string) {
+			sendControl(Message{Kind: "dialFailed", ID: id, Error: code}, "报告工作连接失败时控制连接中断")
+		}
+	}
 	go func() {
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
@@ -106,9 +156,7 @@ func (c *Client) runOnce(parent context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				_ = conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
-				if WriteMessage(conn, Message{Kind: "ping"}) != nil {
-					_ = conn.Close()
+				if !sendControl(Message{Kind: "ping"}, "发送心跳失败") {
 					return
 				}
 			}
@@ -119,20 +167,28 @@ func (c *Client) runOnce(parent context.Context) error {
 		_ = conn.SetReadDeadline(time.Now().Add(35 * time.Second))
 		m, err := ReadMessage(conn)
 		if err != nil {
-			return err
+			select {
+			case err := <-controlWriteErr:
+				return err
+			default:
+				return clientConnectionError("控制连接中断", err)
+			}
 		}
 		if m.Kind == "pong" {
 			continue
 		}
 		if m.Kind != "dial" || len(m.ID) != 64 {
-			return errors.New("invalid control message")
+			return errors.New("控制连接中断：Server 返回了无效的控制消息")
 		}
 		select {
 		case slots <- struct{}{}:
 			workers.Add(1)
-			go func() { defer workers.Done(); defer func() { <-slots }(); c.work(ctx, m) }()
+			go func() { defer workers.Done(); defer func() { <-slots }(); c.work(ctx, m, feedback) }()
 		default:
-			// Server times out requests beyond the bound; don't create more goroutines.
+			c.recordTunnelFailure("clientBusy", errors.New("Client 工作槽已满"))
+			if feedback != nil {
+				feedback(m.ID, "clientBusy")
+			}
 		}
 	}
 }
@@ -141,56 +197,89 @@ func (c *Client) allowed(host string, port uint16) bool {
 	if port == 0 {
 		return false
 	}
-	address := net.JoinHostPort(strings.ToLower(host), strconv.Itoa(int(port)))
-	for _, allowed := range c.config.Allow {
-		if allowed == "*" || address == strings.ToLower(allowed) {
-			return true
-		}
+	if c.allowAll {
+		return true
 	}
-	return false
+	_, allowed := c.allowedTargets[net.JoinHostPort(strings.ToLower(host), strconv.Itoa(int(port)))]
+	return allowed
 }
 
-func (c *Client) work(ctx context.Context, m Message) {
-	conn, err := c.dial(ctx)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	stop := make(chan struct{})
-	defer close(stop)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-stop:
+func (c *Client) work(ctx context.Context, m Message, feedback func(string, string)) {
+	deadline := withTimeoutHint(time.Now().Add(handshakeTimeout), m.TimeoutMS)
+	setup, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	c.changeTunnelCounts(1, 0)
+	active := false
+	defer func() {
+		if active {
+			c.changeTunnelCounts(0, -1)
+		} else {
+			c.changeTunnelCounts(-1, 0)
 		}
 	}()
-	reply := Message{Kind: "work", ClientID: c.config.ID, Token: c.config.Token, ID: m.ID}
+	fail := func(code string, reason error) {
+		if ctx.Err() == nil {
+			c.recordTunnelFailure(code, reason)
+			if feedback != nil {
+				feedback(m.ID, code)
+			}
+		}
+	}
+
+	// Check ACL and dial the target before opening a work socket. Slow targets
+	// cannot hold unauthenticated connections in the Server's intake pool.
+	reply := Message{Kind: "work", ClientID: c.config.ID, Token: c.config.Token, ID: m.ID, DialFeedback: feedback != nil}
 	var target net.Conn
 	if !c.allowed(m.Host, m.Port) {
 		reply.Error = "targetDenied"
+		fail(reply.Error, errors.New("Client 未允许此目标地址和端口"))
 	} else {
+		started := time.Now()
 		dialer := net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
-		target, err = dialer.DialContext(ctx, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(int(m.Port))))
+		var err error
+		target, err = dialer.DialContext(setup, "tcp", net.JoinHostPort(m.Host, strconv.Itoa(int(m.Port))))
+		c.recordDialDuration(false, time.Since(started))
 		if err != nil {
 			reply.Error = "targetUnavailable"
+			var netErr net.Error
+			if errors.Is(setup.Err(), context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+				reply.Error = "targetTimeout"
+			}
+			fail(reply.Error, clientConnectionError("连接内网目标失败", err))
+		} else {
+			defer target.Close()
 		}
 	}
-	if target != nil {
-		defer target.Close()
-	}
-	_ = conn.SetWriteDeadline(time.Now().Add(handshakeTimeout))
-	if WriteMessage(conn, reply) != nil || reply.Error != "" {
+	if reply.Error != "" && feedback != nil {
 		return
 	}
-	_ = conn.SetWriteDeadline(time.Time{})
-	// No response frame on work streams; the next byte belongs to the target.
-	go func() {
-		select {
-		case <-ctx.Done():
+	started := time.Now()
+	conn, err := c.dial(setup)
+	c.recordDialDuration(true, time.Since(started))
+	if err != nil {
+		fail("workUnavailable", clientConnectionError("工作连接回连 Server 失败", err))
+		return
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+		if target != nil {
 			_ = target.Close()
-		case <-stop:
 		}
-	}()
+	})
+	defer stop()
+	_ = conn.SetWriteDeadline(deadline)
+	if err := WriteMessage(conn, reply); err != nil {
+		fail("workUnavailable", clientConnectionError("发送工作连接请求失败", err))
+		return
+	}
+	if reply.Error != "" {
+		return
+	}
+	cancel()
+	_ = conn.SetWriteDeadline(time.Time{})
+	active = true
+	c.changeTunnelCounts(-1, 1)
+	// No response frame on work streams; the next byte belongs to the target.
 	relay(conn, target)
 }

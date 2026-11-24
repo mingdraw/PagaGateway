@@ -92,7 +92,12 @@ func serveFixture(t *testing.T, f *fixture, ln net.Listener) *fixture {
 
 func (f *fixture) startClient(t *testing.T, allowed []string) {
 	t.Helper()
-	client, err := NewClient(ClientConfig{Server: f.address, Fingerprint: f.fingerprint, ID: "office", Token: testClientToken, Allow: allowed})
+	f.startClientWithLimit(t, allowed, 0)
+}
+
+func (f *fixture) startClientWithLimit(t *testing.T, allowed []string, limit int) {
+	t.Helper()
+	client, err := NewClient(ClientConfig{Server: f.address, Fingerprint: f.fingerprint, ID: "office", Token: testClientToken, Allow: allowed, MaxTunnels: limit})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +122,8 @@ func (f *fixture) waitOnline(t *testing.T, want bool) {
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		f.s.mu.Lock()
-		online := f.s.agents["office"] != nil
+		a := f.s.agents["office"]
+		online := a != nil && a.online
 		f.s.mu.Unlock()
 		if online == want {
 			return

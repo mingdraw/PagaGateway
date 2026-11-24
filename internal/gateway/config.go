@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -15,10 +16,16 @@ import (
 
 const PlainTCPWarning = "WARNING: TLS is disabled. Traffic and tokens are sent in plaintext, and the server identity is not verified. Use only on trusted networks."
 
+var (
+	errRelayCertificateMissing  = errors.New("missing relay certificate")
+	errRelayFingerprintMismatch = errors.New("relay certificate fingerprint mismatch")
+)
+
 type Route struct {
 	ID          string `json:"id"`
 	ClientToken string `json:"client_token"`
 	AccessToken string `json:"access_token"`
+	MaxTunnels  int    `json:"max_tunnels,omitempty"`
 }
 
 type ServerConfig struct {
@@ -81,6 +88,9 @@ func (c *ServerConfig) validate() error {
 		if equalToken(r.ClientToken, r.AccessToken) {
 			return errors.New("client and access tokens must be different")
 		}
+		if r.MaxTunnels < 0 {
+			return errors.New("route max_tunnels must not be negative")
+		}
 	}
 	return nil
 }
@@ -141,11 +151,11 @@ func PinnedTLS(fingerprint string) (*tls.Config, error) {
 		InsecureSkipVerify: true, //nolint:gosec // mandatory VerifyConnection below
 		VerifyConnection: func(s tls.ConnectionState) error {
 			if len(s.PeerCertificates) == 0 {
-				return errors.New("missing relay certificate")
+				return errRelayCertificateMissing
 			}
 			digest := sha256.Sum256(s.PeerCertificates[0].Raw)
-			if !equalToken(hex.EncodeToString(digest[:]), hex.EncodeToString(pin)) {
-				return errors.New("relay certificate fingerprint mismatch")
+			if subtle.ConstantTimeCompare(digest[:], pin) != 1 {
+				return errRelayFingerprintMismatch
 			}
 			return nil
 		},

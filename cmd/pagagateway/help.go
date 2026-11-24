@@ -102,6 +102,9 @@ func roleHelp(role string) string {
 	}
 	fmt.Fprintf(&text, "  pagagateway %s restart -pidfile /path/to/%s.pid\n\n", role, role)
 	text.WriteString("status/stop/restart 无需 -config，使用同一用户和同一路径的程序自动定位后台实例。\n同类实例有多个时使用 -pidfile 选择；restart 保留原配置路径、日志路径和启动目录。\n")
+	if role == "client" {
+		text.WriteString("client status 同时显示与 Server 的连接状态。重连时会显示最近失败的原因和时间。\n")
+	}
 	fmt.Fprintf(&text, "省略 run 也可前台运行：pagagateway %s -config %s.json\n", role, role)
 	return text.String()
 }

@@ -152,6 +152,20 @@ func TestBackgroundCommands(t *testing.T) {
 			time.Sleep(25 * time.Millisecond)
 		}
 	}
+	waitLocalClientStatus := func(want string) string {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for {
+			output := mustRun("client", "status")
+			if strings.Contains(output, "连接状态："+want) {
+				return output
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("client connection state did not become %s:\n%s", want, output)
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
 	if output, err := command("server", "clients"); err == nil || !strings.Contains(output, "服务未启动") {
 		t.Fatalf("unstarted Server list: %v\n%s", err, output)
 	}
@@ -421,11 +435,21 @@ func TestBackgroundCommands(t *testing.T) {
 	serverConfig.CertFile, serverConfig.KeyFile = "", ""
 	writeConfig("running-server.json", serverConfig)
 	writeConfig("client.json", gateway.ClientConfig{Server: address, ID: "test", Token: "test-client-token", Allow: []string{"*"}})
+	if output := mustRun("client", "start", "-config", "client.json"); strings.Contains(output, gateway.PlainTCPWarning) {
+		t.Fatal("plaintext Client start showed a Server-only risk warning")
+	}
+	// Starting a Client process succeeds before its Server is reachable.
+	retryStatus := waitLocalClientStatus("重连中")
+	_, failure, found := strings.Cut(retryStatus, "最近失败原因：")
+	reason, _, _ := strings.Cut(failure, "\n")
+	if !found || !strings.HasPrefix(reason, "连接 Server 失败：") || !strings.Contains(retryStatus, "失败时间：") {
+		t.Fatalf("retry status did not show a connection failure with its time:\n%s", retryStatus)
+	}
 	if output := mustRun(serverCommand("start")...); !strings.Contains(output, gateway.PlainTCPWarning) {
 		t.Fatal("plaintext Server start did not show the risk warning")
 	}
-	if output := mustRun("client", "start", "-config", "client.json"); strings.Contains(output, gateway.PlainTCPWarning) {
-		t.Fatal("plaintext Client start showed a Server-only risk warning")
+	if output := waitLocalClientStatus("已连接"); strings.Contains(output, "最近失败原因") || strings.Contains(output, "失败时间") {
+		t.Fatalf("successful registration retained a stale reason:\n%s", output)
 	}
 	waitClientStatus("online")
 	for _, role := range []string{"server", "client"} {
@@ -437,8 +461,19 @@ func TestBackgroundCommands(t *testing.T) {
 	waitClientStatus("online")
 	mustRun("client", "status", "-config", "client.json")
 	mustRun(serverCommand("status")...)
-	mustRun("client", "stop", "-config", "client.json")
+	waitLocalClientStatus("已连接")
 	mustRun(serverCommand("stop")...)
+	waitLocalClientStatus("重连中")
+	mustRun("client", "stop", "-config", "client.json")
+	clientLog, err := os.ReadFile(filepath.Join(directory, "client.log"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Page client retrying in ", reason, "控制连接中断"} {
+		if !strings.Contains(string(clientLog), want) {
+			t.Fatalf("client log did not keep %q", want)
+		}
+	}
 	for _, name := range []string{"server.log", "client.log"} {
 		data, err := os.ReadFile(filepath.Join(directory, name))
 		if err != nil {

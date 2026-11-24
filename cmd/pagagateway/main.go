@@ -157,7 +157,7 @@ func run(args []string) error {
 	return startBackground(ctx, role, configPath, statePath, logPath, "")
 }
 
-func runGateway(ctx context.Context, role, configPath string, ready func(*gateway.Server, bool) error) error {
+func runGateway(ctx context.Context, role, configPath string, ready func(*gateway.Server, *gateway.Client, bool) error) error {
 	switch role {
 	case "server":
 		var configValue gateway.ServerConfig
@@ -174,7 +174,7 @@ func runGateway(ctx context.Context, role, configPath string, ready func(*gatewa
 		}
 		defer listener.Close()
 		if ready != nil {
-			if err := ready(s, configValue.CertFile == ""); err != nil {
+			if err := ready(s, nil, configValue.CertFile == ""); err != nil {
 				return err
 			}
 		}
@@ -190,7 +190,7 @@ func runGateway(ctx context.Context, role, configPath string, ready func(*gatewa
 			return err
 		}
 		if ready != nil {
-			if err := ready(nil, strings.TrimSpace(configValue.Fingerprint) == ""); err != nil {
+			if err := ready(nil, c, strings.TrimSpace(configValue.Fingerprint) == ""); err != nil {
 				return err
 			}
 		}

@@ -40,9 +40,11 @@ type backgroundState struct {
 }
 
 type backgroundReply struct {
-	PID      int                  `json:"pid"`
-	Instance string               `json:"instance"`
-	Clients  []gateway.ClientInfo `json:"clients,omitempty"`
+	PID          int                   `json:"pid"`
+	Instance     string                `json:"instance"`
+	Clients      []gateway.ClientInfo  `json:"clients,omitempty"`
+	ClientStatus *gateway.ClientStatus `json:"client_status,omitempty"`
+	ServerStatus *gateway.ServerStatus `json:"server_status,omitempty"`
 }
 
 func randomID() (string, error) {
@@ -215,10 +217,17 @@ func manageBackground(ctx context.Context, action, role, config, statePath strin
 	}
 	state := instance.state
 	if action == "status" {
-		if err := contactBackground(ctx, state, false); err != nil {
+		reply, err := requestBackground(ctx, state, http.MethodGet, "/status")
+		if err != nil {
 			return fmt.Errorf("Page %s is not responding; start can recover a stale state file", role)
 		}
 		fmt.Printf("Page %s is running (PID %d)\nConfig: %s\nLog: %s\n", role, state.PID, state.Config, state.Log)
+		if role == "client" {
+			printClientStatus(reply.ClientStatus)
+		} else if status := reply.ServerStatus; status != nil {
+			fmt.Printf("连接额度：%d/%d（含工作连接预留）\n隧道：%d 活动，%d 待配对\n",
+				status.CommittedConnections, status.MaxConnections, status.ActiveTunnels, status.PendingTunnels)
+		}
 		return nil
 	}
 	if action == "restart" {
@@ -238,6 +247,40 @@ func manageBackground(ctx context.Context, action, role, config, statePath strin
 	}
 	fmt.Printf("Page %s stopped\n", role)
 	return nil
+}
+
+func printClientStatus(status *gateway.ClientStatus) {
+	if status == nil {
+		fmt.Println("连接状态：当前运行的版本未提供，请使用新版重启 Client")
+		return
+	}
+	label := "未知"
+	switch status.State {
+	case gateway.ClientConnecting:
+		label = "连接中"
+	case gateway.ClientConnected:
+		label = "已连接"
+	case gateway.ClientReconnecting:
+		label = "重连中"
+	}
+	fmt.Printf("连接状态：%s\n", label)
+	if status.LastError != "" {
+		fmt.Printf("最近失败原因：%s\n失败时间：%s\n", status.LastError, status.LastErrorAt.Local().Format(time.RFC3339))
+	}
+	if status.MaxTunnels > 0 {
+		fmt.Printf("隧道：%d 活动，%d 待配对，上限 %d；本地繁忙拒绝 %d 次\n",
+			status.ActiveTunnels, status.PendingTunnels, status.MaxTunnels, status.BusyRejects)
+	}
+	if status.LastTunnelError != "" {
+		fmt.Printf("最近隧道错误：%s\n隧道失败时间：%s\n",
+			status.LastTunnelError, status.LastTunnelErrorAt.Local().Format(time.RFC3339))
+	}
+	if status.LastTargetDialMicros > 0 {
+		fmt.Printf("最近目标拨号：%d µs\n", status.LastTargetDialMicros)
+	}
+	if status.LastWorkDialMicros > 0 {
+		fmt.Printf("最近工作连接拨号：%d µs\n", status.LastWorkDialMicros)
+	}
 }
 
 func validateRestartConfiguration(state backgroundState, statePath string) error {
@@ -333,6 +376,7 @@ func runBackground(role, config, statePath, logPath, instance string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	var runningServer atomic.Pointer[gateway.Server]
+	var runningClient atomic.Pointer[gateway.Client]
 	server := &http.Server{
 		ReadHeaderTimeout: 2 * time.Second,
 		ReadTimeout:       2 * time.Second,
@@ -360,7 +404,16 @@ func runBackground(role, config, statePath, logPath, instance string) error {
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(backgroundReply{PID: state.PID, Instance: state.Instance})
+			reply := backgroundReply{PID: state.PID, Instance: state.Instance}
+			if c := runningClient.Load(); !stop && c != nil {
+				status := c.Status()
+				reply.ClientStatus = &status
+			}
+			if s := runningServer.Load(); !stop && s != nil {
+				status := s.Status()
+				reply.ServerStatus = &status
+			}
+			_ = json.NewEncoder(w).Encode(reply)
 			if stop {
 				if f, ok := w.(http.Flusher); ok {
 					f.Flush()
@@ -388,8 +441,9 @@ func runBackground(role, config, statePath, logPath, instance string) error {
 			unregister()
 		}
 	}()
-	return runGateway(ctx, role, config, func(s *gateway.Server, plainTCP bool) error {
+	return runGateway(ctx, role, config, func(s *gateway.Server, c *gateway.Client, plainTCP bool) error {
 		runningServer.Store(s)
+		runningClient.Store(c)
 		state.PlainTCP = plainTCP
 		var err error
 		unregister, err = registerBackgroundInstance(statePath, instance)

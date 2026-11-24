@@ -77,7 +77,9 @@ cp examples/server.json server.json
 ./pagagateway client start -config client.json
 ```
 
-日志中看到 `Page client registered` 表示登记成功。Client 自动心跳与重连，退避 1–30 秒。控制连接断开会终止所属通道，恢复后由 PagaShell 重连目标；不会重放旧会话。相同 ID 同时只允许一个 Client，重复注册被拒绝。
+日志中看到 `Page client registered` 表示登记成功。Client 自动心跳与重连，退避基准从 1 秒增长至 30 秒，实际时间带随机抖动。控制连接断开会终止所属通道，恢复后由 PagaShell 重连目标；不会重放旧会话。相同 ID 同时只允许一个 Client，重复注册被拒绝。
+
+可以先升级 Server，旧版 Page v1 Client 无需修改配置。新版 Client 会报告自身的 `max_tunnels`；给旧 Client 的 route 选填 `max_tunnels`，Server 也能在达到该并发数时提前返回繁忙。两边都设置时取较小值。
 
 `allowed_targets` 必填。填写 `["*"]` 表示不限制目标地址和端口，Client 可以连接其网络可达的任意 TCP 服务：
 
@@ -133,7 +135,7 @@ Server 和 Client 均支持前台、后台两种运行方式。`run` 在当前�
 ./pagagateway client run -config client.json
 ```
 
-日志写入标准错误，进程管理工具可以直接捕获；前台模式不创建默认日志或后台状态文件。Ctrl+C 可停止，Linux/macOS 的 SIGTERM 同样触发连接清理，正常停止退出码为 `0`；配置或监听失败返回非零退出码。Client 连接中断时保持运行并自动重连。
+日志写入标准错误，进程管理工具可以直接捕获；前台模式不创建默认日志或后台状态文件。Ctrl+C 可停止，Linux/macOS 的 SIGTERM 同样触发连接清理，正常停止退出码为 `0`；配置或监听失败返回非零退出码。Client 首次连接失败或连接中断时会自动重试，每次失败都会记录原因和下次重试间隔。
 
 省略 `run` 的原有前台命令同样支持：
 
@@ -169,9 +171,13 @@ tail -f client.log
 
 Windows PowerShell 将 `./pagagateway` 替换为 `.\pagagateway.exe`，命令参数相同；用 `Get-Content .\client.log -Tail 50 -Wait` 查看日志。
 
-`start` 在配置验证完成后返回；Server 此时已经监听，Client 的连接与注册状态可通过日志查看。重复启动同一实例会报错；启动失败会提示日志位置。`stop` 等待所属连接清理后返回。`status`、`restart` 在实例未运行或无法响应时返回非零退出码；未运行时重复 `stop` 会提示未运行并成功退出。
+`start` 在配置验证完成后返回；Server 此时已经监听，Client 的连接与注册状态可通过 `client status` 查看。重复启动同一实例会报错；启动失败会提示日志位置。`stop` 等待所属连接清理后返回。`status`、`restart` 在实例未运行或无法响应时返回非零退出码；未运行时重复 `stop` 会提示未运行并成功退出。
 
 `status`、`stop`、`restart` 使用启动服务的用户和同一路径的可执行文件，自动定位对应的后台 Server 或 Client，不需要 `-config`。查询与管理命令可从其他目录执行，启动时指定了自定义状态文件也可自动定位。`status` 显示运行实例的 PID、配置和日志路径；`status`、`stop` 不重新读取配置文件，修改后的配置暂时无效也可查看或停止原进程。
+
+`client status` 还会显示连接中、已连接或重连中。重连时显示最近一次失败的原因和时间，例如 Server 拒绝注册、证书指纹不匹配或连接超时。注册成功后清除控制连接的失败原因；每次重连失败仍保留在后台日志中。新版 Client 另显示活动和待配对隧道、上限、最近的目标及工作连接拨号耗时、最近隧道错误。升级后需要重启 Client 进程才能看到新状态。
+
+`server status` 显示已占用的连接额度（包括为工作回连预留的额度）、活动隧道数与待配对数。
 
 `restart` 使用 `start` 时保存的配置文件路径，重新读取修改后的 JSON；保留原日志路径、状态文件路径和启动工作目录，因此相对证书路径不受执行 `restart` 的目录影响。重启会中断已有连接。重启前会校验 JSON、配置字段、指纹并加载证书/私钥，预检失败时原进程继续运行；端口占用等实际启动错误仍可能在原进程停止后出现，此时命令会提示重启失败及日志位置。实例已经停止时，使用 `start -config ...` 启动。
 
@@ -221,6 +227,9 @@ Windows PowerShell 使用 `.\pagagateway.exe server clients`，参数相同。�
 | `ADDRESS` | Server 观察到的 Client 来源 IP 与 TCP 端口；经过 NAT 时是转换后的地址，不一定是内网地址 |
 | `CONNECTED_AT` | 本次注册连接的上线时间 |
 | `LAST_HEARTBEAT` | 本次连接最近收到心跳的时间，尚未收到心跳时为 `-` |
+| `ACTIVE` / `PENDING` | 当前活动和待配对的隧道 |
+| `LIMIT` | Client 报告或 route 配置的并发上限，未知时为 `-` |
+| `BUSY_REJECTS` | 本次 Server 运行期间该 route 的繁忙拒绝数 |
 
 `online` 反映 Client 与 Server 的控制连接，不代表内网目标服务可用。断开后或约 35 秒未收到心跳会转为 `offline`；离线行的地址和时间显示 `-`，重连重新计时，不保留历史连接。表格时间使用查询命令所在机器的本地时区；JSON 的 `connected_at`、`last_heartbeat_at` 使用 UTC 的 RFC 3339 格式，无值时为 `null`，离线 `address` 为空字符串。
 
@@ -231,7 +240,7 @@ Windows PowerShell 使用 `.\pagagateway.exe server clients`，参数相同。�
 - 配置证书和指纹时，两条到 Server 的链路均使用 TLS 1.3，先验证整张证书 DER 的 SHA-256 固定指纹再发送令牌。无证书模式使用未加密 TCP，令牌和流量可能被窃取或篡改，Server 身份不获验证。
 - TLS 模式的固定指纹替代 CA、域名和有效期校验，须通过可信渠道核对。证书替换后同步更新 Client 与 PagaShell，过期也不会自动换证。私钥仅保留在 Server。
 - Server 是受信任的节点，能看到 Client ID、目标地址和加密的 SSH/RDP 字节流。普通 TCP 自身的明文在中转节点可见；Page 不额外提供端到端内容加密。
-- 默认 Server 最多 1024 条连接（控制、访问与工作连接都计数），Client 最多 128 条目标通道。超限请求拒绝或在建连期限内失败。帧最大 8 KiB、目标拨号超时 10 秒、配对超时 15 秒。
+- Server 默认连接额度为 1024：一个在线 Client 占一个控制槽，每条活动或待配对隧道占两个槽。Server 另有最多 128 个短期首帧连接槽，用来认证、接收已预留的工作连接和返回繁忙；首帧槽耗尽时会直接关闭尚未认证的新连接。Client 默认最多 128 条目标通道。帧最大 8 KiB，目标拨号最多 10 秒，访问首帧与配对共用至多 15 秒的预算。
 - 令牌不写日志或错误响应，Client 再次检查目标允许列表。错误、离线或拒绝转发时不回退直连。
 
 ## 构建、验证与发布
@@ -250,6 +259,7 @@ bash scripts/build-release.sh v0.1.0
 go build -o /tmp/pagagateway ./cmd/pagagateway
 # 在 PagaShell/rust 目录运行：
 PAGAGATEWAY_BIN=/tmp/pagagateway cargo test --lib page_go_relay -- --ignored
+# 可选：同时设置 PAGAGATEWAY_CLIENT_BIN 为旧版可执行文件，验证新 Server 与旧 Client。
 ```
 
 TLS 和无证书 TCP 均覆盖注册、令牌鉴权、目标限制、二进制传输及半关闭、前后台命令，以及风险提示仅由无证书 Server 输出；跨仓库测试同时验证两种模式下的 SSH/SFTP 与 RDP 目标证书审核。证书仅配置一项、无效指纹和模式不匹配会失败。

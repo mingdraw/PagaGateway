@@ -34,6 +34,7 @@ func TestClientListLifecycle(t *testing.T) {
 	if reply.Kind != "registered" {
 		t.Fatal(reply)
 	}
+	f.waitOnline(t, true)
 	client := f.s.Clients()[0]
 	if client.Status != "online" || client.Address != conn.LocalAddr().String() || client.ConnectedAt == nil || client.ConnectedAt.Before(before) || client.ConnectedAt.After(time.Now()) || client.LastHeartbeatAt != nil {
 		t.Fatalf("unexpected registered snapshot: %+v", client)
@@ -64,6 +65,7 @@ func TestClientListLifecycle(t *testing.T) {
 	if reply.Kind != "registered" {
 		t.Fatal(reply)
 	}
+	f.waitOnline(t, true)
 	client = f.s.Clients()[0]
 	if client.Status != "online" || client.Address != conn.LocalAddr().String() || !client.ConnectedAt.After(connectedAt) || client.LastHeartbeatAt != nil {
 		t.Fatalf("reconnect retained old connection metadata: %+v", client)
