@@ -12,7 +12,7 @@ Server 同时配置 `cert_file`、`key_file` 时使用 TLS 1.3；客户端配置
 
 | 首帧 kind | 字段 | 验证与结果 |
 |---|---|---|
-| `register` | `client_id`, `token`，可选 `max_tunnels`、`dial_feedback`、`client_version` | route 注册令牌；返回 `registered`，保持控制连接 |
+| `register` | `client_id`, `token`，可选 `max_tunnels`、`dial_feedback`、`server_ping`、`client_version` | route 注册令牌；返回 `registered`，保持控制连接 |
 | `open` | `client_id`, `token`, `host`, `port`，可选 `timeout_ms` | route 访问令牌；等待回连，成功返回 `ready` |
 | `work` | `client_id`, `token`, `id`, 可选 `error` | route 注册令牌及当前控制会话的一次性 ID；不回响应帧 |
 
@@ -30,6 +30,7 @@ Client 检查目标允许列表（`allowed_targets` 包含 `"*"` 时允许任意
 
 - 新 Client 可在 `register` 报告 `max_tunnels` 和 `dial_feedback: true`。Server 按 Client 报告值与 route 配置值中较低的正数控制并发；未报告且未配置时，使用服务端总额度。旧 Client 收到的 `registered`、`dial`、`pong` 保留原字段和格式。
 - 只有 `registered` 确认 `dial_feedback: true`，Client 才会在控制连接上发 `{"version":1,"kind":"dialFailed","id":"请求 ID","error":"code"}`。允许的原因是 `clientBusy`、`workUnavailable`、`targetDenied`、`targetUnavailable`、`targetTimeout`；其他原因归为 `targetUnavailable`。过期反馈忽略。协商成功的 Client 在成功的 `work` 首帧携带 `dial_feedback: true`，Server 拒绝此类工作流时直接关闭，避免把协议错误帧当成目标数据。
+- 新 Client 可在 `register` 报告 `server_ping: true`，Server 在 `registered` 中确认 `server_ping: true`。当同 ID 的新连接发起 `register` 且旧连接已协商此能力时，Server 会在旧控制连接上发送 `{"version":1,"kind":"ping","id":"探活 ID"}` 并等待最多约 2 秒；旧 Client 若在线则回 `{"version":1,"kind":"pong","id":"探活 ID"}`（随后拒绝重复注册 `clientAlreadyOnline`），若静默失联未响应则立即清理旧连接并接纳重连，避免等待 35 秒心跳超时。未协商 `server_ping` 的旧版 Client 不会收到 Server 主动下发的 `ping`，沿用原有 `clientAlreadyOnline` 行为。
 - `open.timeout_ms` 表示调用方剩余等待时间，Server 只用它缩短本地期限。协商成功后，`dial.timeout_ms` 带上发出时剩余的配对预算；Client 在这段预算内完成目标和工作连接的拨号。双方不依赖机器时钟同步。
 
 成功配对后 Server 先向访问连接写 `ready`，双方开始传原始 TCP 字节。工作连接上提前发送的 SSH banner 等必须保留，并在 `ready` 后交给 PagaShell。
@@ -46,4 +47,4 @@ Client 检查目标允许列表（`allowed_targets` 包含 `"*"` 时允许任意
 
 错误帧 `{"version":1,"kind":"error","error":"code"}`，随后关闭。访问端可收到 `unauthorized`、`clientOffline`、`invalidTarget`、`gatewayBusy`、`clientBusy`、`workUnavailable`、`targetDenied`、`targetUnavailable`、`targetTimeout`；注册还可能收到 `clientAlreadyOnline` 或 `gatewayBusy`；旧工作连接仍可收到 `unknownRequest`。不返回令牌、目标系统错误或任意 Client 错误字符串。
 
-Server 对每条待配对访问同时计入访问连接和预留工作连接，总预算最多 15 秒，包含首帧和配对，超时释放预留。控制连接消失时关闭其在途及已配对连接。数据 EOF 保留半关闭，反向数据可排空；读写错误关闭两端。进程停止清理连接。重新注册不延续原 SSH/RDP 状态。
+Server 对每条待配对访问同时计入访问连接和预留工作连接，总预算最多 15 秒，包含首帧和配对，超时释放预留。控制连接消失时关闭其在途及已配对连接。数据 EOF 保留半关闭，反向数据可排空，并在反向连续空闲 30 秒无进展时回收半关闭连接；读写错误关闭两端。进程停止清理连接。重新注册不延续原 SSH/RDP 状态。

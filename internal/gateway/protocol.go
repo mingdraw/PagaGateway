@@ -11,11 +11,24 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
-const MaxFrame = 8192
-const handshakeTimeout = 15 * time.Second
+const (
+	MaxFrame              = 8192
+	handshakeTimeout      = 15 * time.Second
+	relayBufferSize       = 64 * 1024
+	relayHalfCloseTimeout = 30 * time.Second
+)
+
+var relayBufPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, relayBufferSize)
+		return &buf
+	},
+}
 
 var (
 	errInvalidFrameSize = errors.New("invalid frame size")
@@ -36,6 +49,7 @@ type Message struct {
 	Error         string `json:"error,omitempty"`
 	MaxTunnels    int    `json:"max_tunnels,omitempty"`
 	DialFeedback  bool   `json:"dial_feedback,omitempty"`
+	ServerPing    bool   `json:"server_ping,omitempty"`
 	TimeoutMS     int64  `json:"timeout_ms,omitempty"`
 }
 
@@ -111,25 +125,80 @@ func dialFailureCode(code string) string {
 	}
 }
 
-// Preserve TCP half-close so request/EOF/response protocols can drain replies.
+// Preserve TCP half-close so request/EOF/response protocols can drain replies,
+// while bounding idle half-close duration so stalled peers cannot leak slots.
 // TLS CloseWrite sends close_notify without closing the read direction.
 func relay(a, b net.Conn) {
-	done := make(chan struct{})
+	relayWithHalfCloseTimeout(a, b, relayHalfCloseTimeout)
+}
+
+func relayWithHalfCloseTimeout(a, b net.Conn, idle time.Duration) {
+	var halfClosed atomic.Bool
+	refreshInterval := max(time.Millisecond, idle/4)
 	copyOne := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
-		if err != nil {
-			_ = a.Close()
-			_ = b.Close()
-		} else if c, ok := dst.(interface{ CloseWrite() error }); ok {
-			_ = c.CloseWrite()
-		} else {
-			_ = dst.Close()
+		bufPtr := relayBufPool.Get().(*[]byte)
+		defer relayBufPool.Put(bufPtr)
+		buf := *bufPtr
+		var lastRefresh time.Time
+		for {
+			n, rerr := src.Read(buf)
+			if n > 0 {
+				if idle > 0 && halfClosed.Load() {
+					now := time.Now()
+					if lastRefresh.IsZero() || now.Sub(lastRefresh) >= refreshInterval {
+						deadline := now.Add(idle)
+						_ = src.SetReadDeadline(deadline)
+						_ = dst.SetWriteDeadline(deadline)
+						lastRefresh = now
+					}
+				}
+				if err := writeFull(dst, buf[:n]); err != nil {
+					_ = a.Close()
+					_ = b.Close()
+					return
+				}
+			}
+			if rerr != nil {
+				if errors.Is(rerr, io.EOF) {
+					if c, ok := dst.(interface{ CloseWrite() error }); ok {
+						_ = c.CloseWrite()
+					} else {
+						_ = dst.Close()
+					}
+					if idle > 0 && !halfClosed.Swap(true) {
+						deadline := time.Now().Add(idle)
+						_ = dst.SetReadDeadline(deadline)
+						_ = src.SetWriteDeadline(deadline)
+					}
+					return
+				}
+				_ = a.Close()
+				_ = b.Close()
+				return
+			}
 		}
 	}
+	done := make(chan struct{})
 	go func() {
 		copyOne(a, b)
 		close(done)
 	}()
 	copyOne(b, a)
 	<-done
+}
+
+func writeFull(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
 }

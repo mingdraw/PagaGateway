@@ -13,11 +13,17 @@ import (
 	"time"
 )
 
+const serverDNSTTL = 30 * time.Second
+
 type Client struct {
-	config         ClientConfig
-	tls            *tls.Config
-	allowAll       bool
-	allowedTargets map[string]struct{}
+	config     ClientConfig
+	tls        *tls.Config
+	acl        *targetACL
+	serverIsIP bool
+
+	dnsMu          sync.Mutex
+	cachedServer   string
+	cachedServerAt time.Time
 
 	statusMu      sync.RWMutex
 	status        ClientStatus
@@ -28,35 +34,80 @@ func NewClient(c ClientConfig) (*Client, error) {
 	if err := c.validate(); err != nil {
 		return nil, err
 	}
+	acl, err := compileTargetACL(c.Allow)
+	if err != nil {
+		return nil, err
+	}
+	serverHost, _, err := net.SplitHostPort(c.Server)
+	if err != nil {
+		return nil, errors.New("server must be host:port")
+	}
+	serverIsIP := net.ParseIP(serverHost) != nil
 	var t *tls.Config
 	if strings.TrimSpace(c.Fingerprint) != "" {
-		var err error
 		t, err = PinnedTLS(c.Fingerprint)
 		if err != nil {
 			return nil, err
 		}
-	}
-	client := &Client{
-		config: c, tls: t, allowedTargets: make(map[string]struct{}, len(c.Allow)),
-		status: ClientStatus{State: ClientConnecting, MaxTunnels: c.MaxTunnels},
-	}
-	for _, address := range c.Allow {
-		if address == "*" {
-			client.allowAll = true
-			break
+		if !serverIsIP && t.ServerName == "" {
+			t.ServerName = serverHost
 		}
-		client.allowedTargets[strings.ToLower(address)] = struct{}{}
 	}
-	return client, nil
+	return &Client{
+		config: c, tls: t, acl: acl, serverIsIP: serverIsIP,
+		status: ClientStatus{State: ClientConnecting, MaxTunnels: c.MaxTunnels},
+	}, nil
+}
+
+func (c *Client) dialTCP(ctx context.Context) (net.Conn, error) {
+	network := &net.Dialer{Timeout: handshakeTimeout, KeepAlive: 30 * time.Second}
+	if c.serverIsIP {
+		return network.DialContext(ctx, "tcp", c.config.Server)
+	}
+	var cached string
+	c.dnsMu.Lock()
+	if c.cachedServer != "" && time.Since(c.cachedServerAt) < serverDNSTTL {
+		cached = c.cachedServer
+	}
+	c.dnsMu.Unlock()
+	if cached != "" {
+		conn, err := network.DialContext(ctx, "tcp", cached)
+		if err == nil {
+			return conn, nil
+		}
+		c.dnsMu.Lock()
+		if c.cachedServer == cached {
+			c.cachedServer = ""
+		}
+		c.dnsMu.Unlock()
+		if ctx.Err() != nil {
+			return nil, err
+		}
+	}
+	conn, err := network.DialContext(ctx, "tcp", c.config.Server)
+	if err != nil {
+		return nil, err
+	}
+	if remote := conn.RemoteAddr(); remote != nil {
+		c.dnsMu.Lock()
+		c.cachedServer = remote.String()
+		c.cachedServerAt = time.Now()
+		c.dnsMu.Unlock()
+	}
+	return conn, nil
 }
 
 func (c *Client) dial(ctx context.Context) (net.Conn, error) {
-	network := &net.Dialer{Timeout: handshakeTimeout, KeepAlive: 30 * time.Second}
-	if c.tls == nil {
-		return network.DialContext(ctx, "tcp", c.config.Server)
+	raw, err := c.dialTCP(ctx)
+	if err != nil || c.tls == nil {
+		return raw, err
 	}
-	dialer := tls.Dialer{NetDialer: network, Config: c.tls}
-	return dialer.DialContext(ctx, "tcp", c.config.Server)
+	tlsConn := tls.Client(raw, c.tls)
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	return tlsConn, nil
 }
 
 // Run reconnects with bounded exponential backoff. Existing tunnels terminate
@@ -111,7 +162,7 @@ func (c *Client) runOnce(parent context.Context) error {
 	registration := Message{
 		Kind: "register", ClientID: c.config.ID, Token: c.config.Token,
 		ClientVersion: cleanClientVersion(c.config.BuildVersion),
-		MaxTunnels:    c.config.MaxTunnels, DialFeedback: true,
+		MaxTunnels:    c.config.MaxTunnels, DialFeedback: true, ServerPing: true,
 	}
 	err = WriteMessage(conn, registration)
 	if errors.Is(err, errInvalidFrame) && registration.ClientVersion != "" {
@@ -135,27 +186,38 @@ func (c *Client) runOnce(parent context.Context) error {
 	_ = conn.SetWriteDeadline(time.Time{})
 	c.setStatus(ClientStatus{State: ClientConnected})
 	log.Print("Page client registered")
-	writer := newControlWriter(conn)
 	controlWriteErr := make(chan error, 1)
-	sendControl := func(message Message, failure string) bool {
-		err := writer.send(message, time.Now().Add(handshakeTimeout))
-		if err == nil || errors.Is(err, errControlWriteExpired) {
-			return true
-		}
+	recordWriteErr := func(failure string, err error) {
 		select {
 		case controlWriteErr <- clientConnectionError(failure, err):
 		default:
 		}
+		cancel()
 		_ = conn.Close()
-		return false
 	}
+	writer := newControlWriter(ctx, conn, func(err error) {
+		recordWriteErr("控制连接写入失败", err)
+	})
+	var heartbeatWG sync.WaitGroup
+	defer func() {
+		cancel()
+		_ = conn.Close()
+		heartbeatWG.Wait()
+		writer.wait()
+	}()
 	var feedback func(id, code string)
 	if m.DialFeedback {
 		feedback = func(id, code string) {
-			sendControl(Message{Kind: "dialFailed", ID: id, Error: code}, "报告工作连接失败时控制连接中断")
+			if !writer.enqueuePriority(Message{Kind: "dialFailed", ID: id, Error: code}, time.Now().Add(handshakeTimeout)) {
+				if ctx.Err() == nil {
+					recordWriteErr("报告工作连接失败时控制连接中断", errControlWriteExpired)
+				}
+			}
 		}
 	}
+	heartbeatWG.Add(1)
 	go func() {
+		defer heartbeatWG.Done()
 		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for {
@@ -163,7 +225,9 @@ func (c *Client) runOnce(parent context.Context) error {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if !sendControl(Message{Kind: "ping"}, "发送心跳失败") {
+				err := writer.sendPriority(Message{Kind: "ping"}, time.Now().Add(handshakeTimeout))
+				if err != nil && !errors.Is(err, errControlWriteExpired) {
+					recordWriteErr("发送心跳失败", err)
 					return
 				}
 			}
@@ -181,10 +245,19 @@ func (c *Client) runOnce(parent context.Context) error {
 				return clientConnectionError("控制连接中断", err)
 			}
 		}
-		if m.Kind == "pong" {
+		switch m.Kind {
+		case "pong":
 			continue
-		}
-		if m.Kind != "dial" || len(m.ID) != 64 {
+		case "ping":
+			if !writer.enqueuePriority(Message{Kind: "pong", ID: m.ID}, time.Now().Add(handshakeTimeout)) {
+				return errors.New("控制连接中断：响应探活失败")
+			}
+			continue
+		case "dial":
+			if len(m.ID) != 64 {
+				return errors.New("控制连接中断：Server 返回了无效的控制消息")
+			}
+		default:
 			return errors.New("控制连接中断：Server 返回了无效的控制消息")
 		}
 		select {
@@ -201,14 +274,7 @@ func (c *Client) runOnce(parent context.Context) error {
 }
 
 func (c *Client) allowed(host string, port uint16) bool {
-	if port == 0 {
-		return false
-	}
-	if c.allowAll {
-		return true
-	}
-	_, allowed := c.allowedTargets[net.JoinHostPort(strings.ToLower(host), strconv.Itoa(int(port)))]
-	return allowed
+	return c.acl.allowed(host, port)
 }
 
 func (c *Client) work(ctx context.Context, m Message, feedback func(string, string)) {

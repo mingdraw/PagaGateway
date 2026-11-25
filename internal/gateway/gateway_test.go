@@ -11,6 +11,7 @@ import (
 	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -401,4 +402,400 @@ func TestFrameLimitsAndExactReads(t *testing.T) {
 			t.Fatal("oversize/empty frame accepted")
 		}
 	}
+}
+
+type transientAcceptErr struct{}
+
+func (transientAcceptErr) Error() string   { return "temporary accept error" }
+func (transientAcceptErr) Timeout() bool   { return false }
+func (transientAcceptErr) Temporary() bool { return true }
+
+type flakyListener struct {
+	net.Listener
+	mu       sync.Mutex
+	failures int
+}
+
+func (l *flakyListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	if l.failures > 0 {
+		l.failures--
+		l.mu.Unlock()
+		return nil, transientAcceptErr{}
+	}
+	l.mu.Unlock()
+	return l.Listener.Accept()
+}
+
+func TestServerServeRetriesTransientAcceptErrors(t *testing.T) {
+	s, err := NewServer(ServerConfig{Listen: "127.0.0.1:0", Routes: []Route{{ID: "office", ClientToken: testClientToken, AccessToken: testAccessToken}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.Listen()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln := &flakyListener{Listener: raw, failures: 2}
+	f := serveFixture(t, &fixture{s: s, address: raw.Addr().String()}, ln)
+	address := target(t, false)
+	f.startClient(t, []string{address})
+	conn, reply := f.request(t, openMessage(address))
+	if reply.Kind != "ready" {
+		t.Fatalf("expected ready after transient accept errors, got %+v", reply)
+	}
+	if _, err := conn.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	var out [2]byte
+	if _, err := io.ReadFull(conn, out[:]); err != nil || string(out[:]) != "ok" {
+		t.Fatalf("unexpected echo: %q, %v", out, err)
+	}
+	if isTransientAcceptError(net.ErrClosed) {
+		t.Fatal("net.ErrClosed must not be treated as transient")
+	}
+	if isTransientAcceptError(errors.New("fatal listener failure")) {
+		t.Fatal("arbitrary fatal error must not be treated as transient")
+	}
+}
+
+func TestReconnectProbesAndEvictsStaleClient(t *testing.T) {
+	f := setupPlainTCP(t)
+	f.s.probeTimeout = 150 * time.Millisecond
+	address := target(t, false)
+
+	// Simulate a new Client (server_ping: true) whose control socket silently hangs
+	// (e.g., NAT drop) without sending FIN/RST.
+	ghost, registered := f.request(t, Message{
+		Kind: "register", ClientID: "office", Token: testClientToken,
+		DialFeedback: true, ServerPing: true,
+	})
+	if registered.Kind != "registered" || !registered.ServerPing {
+		t.Fatalf("expected server_ping negotiation, got %+v", registered)
+	}
+	f.waitOnline(t, true)
+
+	// Open a tunnel on the ghost so we also verify eviction tears down old tunnels.
+	oldAccess := sendFixtureMessage(t, f.address, openMessage(address))
+	dial := readFixtureMessage(t, ghost, "dial")
+	oldWork := sendFixtureMessage(t, f.address, Message{
+		Kind: "work", ClientID: "office", Token: testClientToken, ID: dial.ID, DialFeedback: true,
+	})
+	readFixtureMessage(t, oldAccess, "ready")
+	waitTunnelCounts(t, f.s, 1, 0)
+
+	// Freeze ghost: stop reading/replying to pings, then reconnect a healthy Client.
+	started := time.Now()
+	f.startClient(t, []string{address})
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("stale client eviction took too long: %s", elapsed)
+	}
+
+	// Evicted ghost tunnel must be closed promptly.
+	_ = oldAccess.SetReadDeadline(time.Now().Add(time.Second))
+	var b [1]byte
+	if _, err := oldAccess.Read(b[:]); err == nil {
+		t.Fatal("evicted ghost tunnel stayed open")
+	}
+	_ = oldWork.Close()
+	_ = ghost.Close()
+
+	// Fresh Client must relay traffic immediately.
+	conn, reply := f.request(t, openMessage(address))
+	if reply.Kind != "ready" {
+		t.Fatalf("new client failed after evicting stale ghost: %+v", reply)
+	}
+	if _, err := conn.Write([]byte("fresh")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "fresh" {
+		t.Fatalf("unexpected relay reply: %q, %v", buf, err)
+	}
+}
+
+func TestReconnectRejectsLiveClientAfterProbe(t *testing.T) {
+	f := setupPlainTCP(t)
+	f.s.probeTimeout = 500 * time.Millisecond
+	address := target(t, false)
+	f.startClient(t, []string{address})
+
+	active, ready := f.request(t, openMessage(address))
+	if ready.Kind != "ready" {
+		t.Fatal(ready)
+	}
+
+	// Duplicate registration against a live Client must fail with clientAlreadyOnline
+	// after the Server probes the existing Client.
+	_, reply := f.request(t, Message{
+		Kind: "register", ClientID: "office", Token: testClientToken, ServerPing: true,
+	})
+	if reply.Error != "clientAlreadyOnline" {
+		t.Fatalf("expected clientAlreadyOnline for live client, got %+v", reply)
+	}
+
+	// Existing tunnel must remain completely undisturbed.
+	if _, err := active.Write([]byte("still-alive")); err != nil {
+		t.Fatal(err)
+	}
+	out := make([]byte, len("still-alive"))
+	if _, err := io.ReadFull(active, out); err != nil || string(out) != "still-alive" {
+		t.Fatalf("active tunnel disturbed by probe: %q, %v", out, err)
+	}
+}
+
+func TestLegacyClientNeverReceivesServerPing(t *testing.T) {
+	f := setupPlainTCP(t)
+	f.s.probeTimeout = 150 * time.Millisecond
+
+	// Register a legacy Client that omits dial_feedback and server_ping.
+	legacy, registered := f.request(t, Message{
+		Kind: "register", ClientID: "office", Token: testClientToken,
+	})
+	if registered.Kind != "registered" || registered.ServerPing || registered.DialFeedback {
+		t.Fatalf("unexpected legacy registration response: %+v", registered)
+	}
+	f.waitOnline(t, true)
+
+	// Duplicate registration must be rejected WITHOUT sending any ping to the legacy Client.
+	_, duplicate := f.request(t, Message{
+		Kind: "register", ClientID: "office", Token: testClientToken, ServerPing: true,
+	})
+	if duplicate.Error != "clientAlreadyOnline" {
+		t.Fatalf("expected clientAlreadyOnline, got %+v", duplicate)
+	}
+
+	// Legacy Client must still receive normal dial messages (not unexpected ping).
+	address := target(t, false)
+	access := sendFixtureMessage(t, f.address, openMessage(address))
+	dial := readFixtureMessage(t, legacy, "dial")
+	work := sendFixtureMessage(t, f.address, Message{
+		Kind: "work", ClientID: "office", Token: testClientToken, ID: dial.ID,
+	})
+	readFixtureMessage(t, access, "ready")
+	if _, err := work.Write([]byte("ok")); err != nil {
+		t.Fatal(err)
+	}
+	var out [2]byte
+	if _, err := io.ReadFull(access, out[:]); err != nil || string(out[:]) != "ok" {
+		t.Fatalf("legacy relay failed: %q, %v", out, err)
+	}
+}
+
+func TestNewClientWorksWithLegacyServer(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	address := target(t, false)
+	host, portStr, _ := net.SplitHostPort(address)
+	portNum, _ := strconv.Atoi(portStr)
+
+	serverDone := make(chan error, 1)
+	go func() {
+		ctrl, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer ctrl.Close()
+		_ = ctrl.SetDeadline(time.Now().Add(5 * time.Second))
+		reg, err := ReadMessage(ctrl)
+		if err != nil || reg.Kind != "register" {
+			serverDone <- fmt.Errorf("unexpected register: %+v, %v", reg, err)
+			return
+		}
+		// Legacy server omits dial_feedback and server_ping in registered reply.
+		if err := WriteMessage(ctrl, Message{Kind: "registered"}); err != nil {
+			serverDone <- err
+			return
+		}
+		dialID := randomID()
+		if err := WriteMessage(ctrl, Message{Kind: "dial", ID: dialID, Host: host, Port: uint16(portNum)}); err != nil {
+			serverDone <- err
+			return
+		}
+		workConn, err := ln.Accept()
+		if err != nil {
+			serverDone <- err
+			return
+		}
+		defer workConn.Close()
+		_ = workConn.SetDeadline(time.Now().Add(5 * time.Second))
+		workMsg, err := ReadMessage(workConn)
+		if err != nil || workMsg.Kind != "work" || workMsg.ID != dialID || workMsg.Error != "" {
+			serverDone <- fmt.Errorf("unexpected work: %+v, %v", workMsg, err)
+			return
+		}
+		if _, err := workConn.Write([]byte("legacy-server")); err != nil {
+			serverDone <- err
+			return
+		}
+		echoed := make([]byte, len("legacy-server"))
+		if _, err := io.ReadFull(workConn, echoed); err != nil || string(echoed) != "legacy-server" {
+			serverDone <- fmt.Errorf("unexpected echo: %q, %v", echoed, err)
+			return
+		}
+		serverDone <- nil
+	}()
+
+	client, err := NewClient(ClientConfig{
+		Server: ln.Addr().String(), ID: "office", Token: testClientToken, Allow: []string{address},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	clientDone := make(chan struct{})
+	go func() { _ = client.Run(ctx); close(clientDone) }()
+	defer func() { cancel(); <-clientDone }()
+
+	select {
+	case err := <-serverDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("legacy server test timed out")
+	}
+}
+
+func TestControlWriterPriorityAndExpiry(t *testing.T) {
+	a, b := net.Pipe()
+	defer a.Close()
+	defer b.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w := newControlWriter(ctx, a, nil)
+	defer func() { cancel(); _ = a.Close(); w.wait() }()
+
+	// Block the first write on net.Pipe so subsequent enqueued frames sit in the queues.
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- w.send(Message{Kind: "dial", ID: "first"}, time.Now().Add(3*time.Second))
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	// Enqueue an already-short normal dial and a priority pong.
+	expiredErr := w.send(Message{Kind: "dial", ID: "expired"}, time.Now().Add(5*time.Millisecond))
+	if !errors.Is(expiredErr, errControlWriteExpired) {
+		t.Fatalf("expected errControlWriteExpired, got %v", expiredErr)
+	}
+	normalDone := make(chan error, 1)
+	go func() {
+		normalDone <- w.send(Message{Kind: "dial", ID: "normal"}, time.Now().Add(3*time.Second))
+	}()
+	time.Sleep(20 * time.Millisecond)
+	if !w.enqueuePriority(Message{Kind: "pong", ID: "prio"}, time.Now().Add(3*time.Second)) {
+		t.Fatal("failed to enqueue priority pong")
+	}
+
+	// Reading from b must yield first, then priority pong BEFORE normal dial.
+	m1, err := ReadMessage(b)
+	if err != nil || m1.ID != "first" {
+		t.Fatalf("expected first, got %+v, %v", m1, err)
+	}
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	m2, err := ReadMessage(b)
+	if err != nil || m2.Kind != "pong" || m2.ID != "prio" {
+		t.Fatalf("expected priority pong ahead of normal dial, got %+v, %v", m2, err)
+	}
+	m3, err := ReadMessage(b)
+	if err != nil || m3.Kind != "dial" || m3.ID != "normal" {
+		t.Fatalf("expected normal dial, got %+v, %v", m3, err)
+	}
+	if err := <-normalDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func tcpPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := ln.Accept()
+		accepted <- c
+	}()
+	c1, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c2 := <-accepted
+	if c2 == nil {
+		_ = c1.Close()
+		t.Fatal("accept failed")
+	}
+	t.Cleanup(func() { _ = c1.Close(); _ = c2.Close() })
+	return c1, c2
+}
+
+func TestRelayHalfCloseIdleTimeoutAndActiveDrain(t *testing.T) {
+	t.Run("stalled half-close terminates after idle timeout", func(t *testing.T) {
+		clientEnd, relayA := tcpPair(t)
+		relayB, stalledPeer := tcpPair(t)
+		done := make(chan struct{})
+		go func() {
+			relayWithHalfCloseTimeout(relayA, relayB, 120*time.Millisecond)
+			close(done)
+		}()
+		// Client finishes sending and half-closes; stalledPeer reads EOF but never closes back.
+		_, _ = clientEnd.Write([]byte("req"))
+		_ = clientEnd.(interface{ CloseWrite() error }).CloseWrite()
+		got, _ := io.ReadAll(stalledPeer)
+		if string(got) != "req" {
+			t.Fatalf("stalledPeer got %q", got)
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("relay leaked on stalled half-close")
+		}
+	})
+
+	t.Run("active draining extends half-close idle deadline", func(t *testing.T) {
+		clientEnd, relayA := tcpPair(t)
+		relayB, slowPeer := tcpPair(t)
+		done := make(chan struct{})
+		go func() {
+			relayWithHalfCloseTimeout(relayA, relayB, 160*time.Millisecond)
+			close(done)
+		}()
+		_, _ = clientEnd.Write([]byte("req"))
+		_ = clientEnd.(interface{ CloseWrite() error }).CloseWrite()
+		gotReq, _ := io.ReadAll(slowPeer)
+		if string(gotReq) != "req" {
+			t.Fatalf("slowPeer got %q", gotReq)
+		}
+		// Trickle 6 chunks spaced 60ms apart (total 360ms > 160ms idle timeout).
+		var want bytes.Buffer
+		for i := 0; i < 6; i++ {
+			time.Sleep(60 * time.Millisecond)
+			chunk := fmt.Sprintf("chunk-%d|", i)
+			want.WriteString(chunk)
+			if _, err := slowPeer.Write([]byte(chunk)); err != nil {
+				t.Fatalf("slowPeer write %d failed: %v", i, err)
+			}
+		}
+		_ = slowPeer.(interface{ CloseWrite() error }).CloseWrite()
+		gotResp, err := io.ReadAll(clientEnd)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotResp) != want.String() {
+			t.Fatalf("got %q, want %q", gotResp, want.String())
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatal("relay did not finish after drain")
+		}
+	})
 }

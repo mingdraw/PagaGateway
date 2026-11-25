@@ -10,7 +10,6 @@ import (
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 )
 
@@ -115,15 +114,8 @@ func (c *ClientConfig) validate() error {
 	if !validID(c.ID) || len(c.Allow) == 0 {
 		return errors.New("valid id and non-empty allowed_targets are required")
 	}
-	for _, address := range c.Allow {
-		if address == "*" {
-			continue
-		}
-		host, port, err := net.SplitHostPort(address)
-		number, portErr := strconv.ParseUint(port, 10, 16)
-		if err != nil || host == "" || portErr != nil || number == 0 || strconv.FormatUint(number, 10) != port {
-			return errors.New(`allowed_targets must contain "*" or exact host:port addresses`)
-		}
+	if _, err := compileTargetACL(c.Allow); err != nil {
+		return err
 	}
 	if c.MaxTunnels == 0 {
 		c.MaxTunnels = 128

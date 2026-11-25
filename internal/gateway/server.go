@@ -11,13 +11,25 @@ import (
 	"time"
 )
 
+const defaultProbeTimeout = 2 * time.Second
+
+type livenessProbe struct {
+	id    string
+	done  chan struct{}
+	alive bool
+}
+
 type agent struct {
 	conn         net.Conn
-	writer       controlWriter
+	writer       *controlWriter
 	ctx          context.Context
+	cancel       context.CancelFunc
 	dialFeedback bool
+	serverPing   bool
 	maxTunnels   int
 	version      string
+	probeMu      sync.Mutex
+	probe        *livenessProbe
 	// Lifecycle and counters are protected by Server.mu.
 	online          bool
 	pending         int
@@ -25,6 +37,96 @@ type agent struct {
 	address         string
 	connectedAt     time.Time
 	lastHeartbeatAt time.Time
+}
+
+func (a *agent) finishProbe(p *livenessProbe, alive bool) {
+	a.probeMu.Lock()
+	if a.probe == p {
+		p.alive = alive
+		a.probe = nil
+		close(p.done)
+	}
+	a.probeMu.Unlock()
+}
+
+func (a *agent) completeProbe(id string) {
+	a.probeMu.Lock()
+	p := a.probe
+	if p != nil && (id == "" || p.id == id) {
+		p.alive = true
+		a.probe = nil
+		close(p.done)
+	}
+	a.probeMu.Unlock()
+}
+
+func (a *agent) failPendingProbe() {
+	a.probeMu.Lock()
+	p := a.probe
+	if p != nil {
+		p.alive = false
+		a.probe = nil
+		close(p.done)
+	}
+	a.probeMu.Unlock()
+}
+
+func (a *agent) probeAlive(deadline time.Time) bool {
+	if !a.serverPing {
+		return a.ctx.Err() == nil
+	}
+	if a.ctx.Err() != nil {
+		return false
+	}
+	a.probeMu.Lock()
+	p := a.probe
+	leader := p == nil
+	if leader {
+		p = &livenessProbe{id: randomID(), done: make(chan struct{})}
+		a.probe = p
+	}
+	a.probeMu.Unlock()
+	if leader {
+		go func() {
+			if err := a.writer.sendPriority(Message{Kind: "ping", ID: p.id}, deadline); err != nil {
+				a.finishProbe(p, false)
+				return
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				a.finishProbe(p, false)
+				return
+			}
+			timer := time.NewTimer(remaining)
+			defer timer.Stop()
+			select {
+			case <-p.done:
+			case <-a.ctx.Done():
+				a.finishProbe(p, false)
+			case <-timer.C:
+				a.finishProbe(p, false)
+			}
+		}()
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		select {
+		case <-p.done:
+			return p.alive
+		default:
+			return false
+		}
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-p.done:
+		return p.alive
+	case <-a.ctx.Done():
+		return false
+	case <-timer.C:
+		return false
+	}
 }
 
 type work struct {
@@ -47,13 +149,21 @@ type serverRoute struct {
 }
 
 type Server struct {
-	config  ServerConfig
-	mu      sync.Mutex
-	agents  map[string]*agent
-	pending map[string]*pending
-	routes  map[string]*serverRoute
-	tunnels int // open requests including their reserved work connections
-	active  int
+	config       ServerConfig
+	probeTimeout time.Duration
+	mu           sync.Mutex
+	agents       map[string]*agent
+	pending      map[string]*pending
+	routes       map[string]*serverRoute
+	tunnels      int // open requests including their reserved work connections
+	active       int
+}
+
+func (s *Server) livenessProbeTimeout() time.Duration {
+	if s.probeTimeout > 0 {
+		return s.probeTimeout
+	}
+	return defaultProbeTimeout
 }
 
 func NewServer(c ServerConfig) (*Server, error) {
@@ -121,14 +231,31 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 		wg.Wait()
 	}()
+	var acceptDelay time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return err
+			if !isTransientAcceptError(err) {
+				return err
+			}
+			if acceptDelay == 0 {
+				acceptDelay = 5 * time.Millisecond
+			} else {
+				acceptDelay = min(acceptDelay*2, time.Second)
+			}
+			timer := time.NewTimer(acceptDelay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil
+			case <-timer.C:
+			}
+			continue
 		}
+		acceptDelay = 0
 		mu.Lock()
 		if handshakes >= maxHandshakes || len(connections)-s.config.MaxConnections >= maxHandshakes || ctx.Err() != nil {
 			mu.Unlock()
@@ -159,6 +286,21 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			})
 		}()
 	}
+}
+
+func isTransientAcceptError(err error) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	var temp interface{ Temporary() bool }
+	if errors.As(err, &temp) && temp.Temporary() {
+		return true
+	}
+	return isTransientAcceptErrno(err)
 }
 
 func reject(c net.Conn, code string) {
@@ -233,42 +375,100 @@ func (s *Server) claimPendingLocked(id string, a *agent) *pending {
 
 func (s *Server) register(c net.Conn, m Message, deadline time.Time, admitted func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	id := m.ClientID
 	limit := max(0, m.MaxTunnels)
 	if configured := s.routes[id].maxTunnels; configured > 0 && (limit == 0 || configured < limit) {
 		limit = configured
 	}
 	a := &agent{
-		conn: c, writer: newControlWriter(c), ctx: ctx,
-		address: c.RemoteAddr().String(), maxTunnels: limit, dialFeedback: m.DialFeedback,
+		conn: c, ctx: ctx, cancel: cancel,
+		address: c.RemoteAddr().String(), maxTunnels: limit,
+		dialFeedback: m.DialFeedback, serverPing: m.ServerPing,
 		version: cleanClientVersion(m.ClientVersion),
 	}
 	if a.version == "" {
 		a.version = LegacyClientVersion
 	}
+	var evicted *agent
 	s.mu.Lock()
-	if s.agents[id] != nil {
-		s.mu.Unlock()
-		reject(c, "clientAlreadyOnline")
-		return
+	existing := s.agents[id]
+	if existing != nil {
+		switch {
+		case existing.ctx.Err() != nil:
+			// Previous control session is already tearing down; reuse its agent slot.
+			evicted = existing
+			s.agents[id] = a
+		case existing.online && existing.serverPing:
+			s.mu.Unlock()
+			probeDeadline := time.Now().Add(s.livenessProbeTimeout())
+			if deadline.Before(probeDeadline) {
+				probeDeadline = deadline
+			}
+			if existing.probeAlive(probeDeadline) {
+				cancel()
+				reject(c, "clientAlreadyOnline")
+				return
+			}
+			s.mu.Lock()
+			switch s.agents[id] {
+			case existing:
+				evicted = existing
+				existing.cancel()
+				s.agents[id] = a
+			case nil:
+				if len(s.agents)+2*s.tunnels >= s.config.MaxConnections {
+					s.routes[id].busyRejects++
+					s.mu.Unlock()
+					cancel()
+					reject(c, "gatewayBusy")
+					return
+				}
+				s.agents[id] = a
+			default:
+				s.mu.Unlock()
+				cancel()
+				reject(c, "clientAlreadyOnline")
+				return
+			}
+		default:
+			// Legacy Clients do not understand Server-initiated ping frames.
+			s.mu.Unlock()
+			cancel()
+			reject(c, "clientAlreadyOnline")
+			return
+		}
+	} else {
+		if len(s.agents)+2*s.tunnels >= s.config.MaxConnections {
+			s.routes[id].busyRejects++
+			s.mu.Unlock()
+			cancel()
+			reject(c, "gatewayBusy")
+			return
+		}
+		s.agents[id] = a
 	}
-	if len(s.agents)+2*s.tunnels >= s.config.MaxConnections {
-		s.routes[id].busyRejects++
-		s.mu.Unlock()
-		reject(c, "gatewayBusy")
-		return
-	}
-	s.agents[id] = a
 	s.mu.Unlock()
+	if evicted != nil {
+		evicted.cancel()
+		_ = evicted.conn.Close()
+	}
+	a.writer = newControlWriter(ctx, c, func(error) {
+		cancel()
+		_ = c.Close()
+	})
 	admitted()
 	defer func() {
 		cancel()
+		a.failPendingProbe()
+		_ = c.Close()
+		a.writer.wait()
 		s.mu.Lock()
-		delete(s.agents, id)
+		if s.agents[id] == a {
+			delete(s.agents, id)
+		}
 		s.mu.Unlock()
 	}()
-	if a.writer.send(Message{Kind: "registered", DialFeedback: a.dialFeedback}, deadline) != nil {
+	if a.writer.send(Message{Kind: "registered", DialFeedback: a.dialFeedback, ServerPing: a.serverPing}, deadline) != nil {
 		return
 	}
 	s.mu.Lock()
@@ -286,9 +486,15 @@ func (s *Server) register(c net.Conn, m Message, deadline time.Time, admitted fu
 			s.mu.Lock()
 			a.lastHeartbeatAt = time.Now().UTC()
 			s.mu.Unlock()
-			if a.writer.send(Message{Kind: "pong"}, time.Now().Add(handshakeTimeout)) != nil {
+			a.completeProbe("")
+			if !a.writer.enqueuePriority(Message{Kind: "pong"}, time.Now().Add(handshakeTimeout)) {
 				return
 			}
+		case a.serverPing && m.Kind == "pong":
+			s.mu.Lock()
+			a.lastHeartbeatAt = time.Now().UTC()
+			s.mu.Unlock()
+			a.completeProbe(m.ID)
 		case a.dialFeedback && m.Kind == "dialFailed":
 			s.mu.Lock()
 			p := s.claimPendingLocked(m.ID, a)
@@ -364,6 +570,7 @@ func (s *Server) open(c net.Conn, m Message, deadline time.Time, admitted func()
 			return
 		}
 		reject(c, "clientOffline")
+		a.cancel()
 		_ = a.conn.Close()
 		return
 	}

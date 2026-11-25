@@ -79,10 +79,22 @@ func TestAllowedTargetsConfiguration(t *testing.T) {
 		{"wildcard", []string{"*"}, true},
 		{"exact", []string{"127.0.0.1:22", "Server.LAN:3389", "[::1]:443"}, true},
 		{"mixed", []string{"127.0.0.1:22", "*"}, true},
+		{"wildcard port", []string{"127.0.0.1:*", "*:443"}, true},
+		{"port range", []string{"127.0.0.1:8000-8099", "[::1]:22-22"}, true},
+		{"cidr ipv4 and ipv6", []string{"10.0.0.0/8:22", "192.168.1.0/24:*", "[2001:db8::/32]:8000-8080"}, true},
+		{"domain wildcard", []string{"*.internal:22", "*.corp.example.com:*"}, true},
 		{"empty", nil, false},
 		{"invalid address with wildcard", []string{"*", "invalid"}, false},
-		{"wildcard port", []string{"127.0.0.1:*"}, false},
 		{"zero port", []string{"127.0.0.1:0"}, false},
+		{"leading zero port", []string{"127.0.0.1:022"}, false},
+		{"reversed port range", []string{"127.0.0.1:8080-8000"}, false},
+		{"zero start port range", []string{"127.0.0.1:0-80"}, false},
+		{"invalid cidr prefix", []string{"10.0.0.0/33:22"}, false},
+		{"ipv6 zone id", []string{"[::1%lo0]:22"}, false},
+		{"mid wildcard domain", []string{"foo*.internal:22"}, false},
+		{"wildcard ip", []string{"*.10.0.0.1:22"}, false},
+		{"empty wildcard suffix", []string{"*.:22"}, false},
+		{"whitespace padding", []string{" 127.0.0.1:22 "}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			client := ClientConfig{Server: "127.0.0.1:7443", ID: "office", Token: "client", Allow: tc.allow}
